@@ -1,0 +1,20 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "sentry",
+  "version": "1.0.0",
+  "description": "Read-only Sentry integration over the Sentry REST API. Exposes a local MCP server with list_projects, search_issues, get_issue, get_event, and get_issue_tags so crash reports, stack traces and tag breakdowns can be pulled into Kiro while coding. Uses a per-user Sentry auth token. Strictly read-only: it performs HTTP GET requests only and never resolves, ignores, assigns, comments on, or otherwise modifies anything in Sentry.",
+  "author": {
+    "name": "Luke Worthington"
+  },
+  "repository": "https://github.com/lukewo/kiro-power-sentry",
+  "keywords": [
+    "sentry",
+    "error monitoring",
+    "crash reports",
+    "stack traces",
+    "issues",
+    "rest api",
+    "read-only"
+  ],
+  "license": "MIT"
+}

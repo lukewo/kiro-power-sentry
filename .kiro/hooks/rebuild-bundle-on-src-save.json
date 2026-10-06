@@ -1,0 +1,14 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Rebuild server bundle on src save",
+      "trigger": "PostFileSave",
+      "matcher": "server[\\\\/]src[\\\\/].*\\.js$",
+      "action": {
+        "type": "command",
+        "command": "cd server && npm run build"
+      }
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+# Build-time dependencies only. The power ships a prebuilt, self-contained
+# bundle at server/dist/index.js, so node_modules is never needed at install
+# time and is excluded to keep the package lean.
+server/node_modules/
+# The bundle itself (server/dist/) IS committed - it is what the power runs.
