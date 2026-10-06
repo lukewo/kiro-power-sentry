@@ -109,6 +109,66 @@ export function formatIssueList(issues, { returned, hasMore, filters } = {}) {
   return lines.join("\n");
 }
 
+// Fields requested from the logs dataset, in request order. Confirmed against
+// the live API: user.id and severity_number are accepted but never populated on
+// log rows, so they are not requested.
+export const LOG_TIMESTAMP_FIELD = "timestamp";
+export const LOG_MESSAGE_FIELD = "message";
+export const LOG_SEVERITY_FIELD = "severity";
+export const LOG_TRACE_FIELD = "trace";
+export const LOG_FIELDS = [
+  LOG_TIMESTAMP_FIELD,
+  LOG_MESSAGE_FIELD,
+  LOG_SEVERITY_FIELD,
+  LOG_TRACE_FIELD,
+  "project",
+  "environment",
+  "release",
+];
+
+/** One short block per log row, in API order, plus filters and a has-more line. */
+export function formatLogList(rows, { returned, hasMore, filters, fields = LOG_FIELDS } = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  const lines = [];
+
+  const filterLines = keyValueLines(filters);
+  lines.push("## Filters applied");
+  lines.push("");
+  lines.push(filterLines.length > 0 ? filterLines.join("\n") : "(none)");
+  lines.push("");
+  lines.push(`## Log entries (${returned ?? list.length} returned)`);
+  lines.push("");
+
+  if (list.length === 0) {
+    lines.push("No log entries matched.");
+  } else {
+    const detailFields = fields.filter(
+      (field) =>
+        field !== LOG_TIMESTAMP_FIELD && field !== LOG_MESSAGE_FIELD && field !== LOG_SEVERITY_FIELD
+    );
+    for (const row of list) {
+      const severity = cell(row?.[LOG_SEVERITY_FIELD]) || "none";
+      const message = tidyText(row?.[LOG_MESSAGE_FIELD] ?? "", 500).replace(/\n+/g, " ");
+      lines.push(
+        `### ${cell(row?.[LOG_TIMESTAMP_FIELD]) || "(no timestamp)"} [${severity}] ${message || "(no message)"}`
+      );
+      lines.push("");
+      for (const field of detailFields) {
+        const value = cell(row?.[field]);
+        if (value) lines.push(`- ${field}: ${value}`);
+      }
+      lines.push("");
+    }
+  }
+
+  lines.push(
+    hasMore
+      ? "More log entries exist beyond this page. Narrow the query, raise limit (max 100) or shorten the time window to see them."
+      : "This is the complete result set for these filters."
+  );
+  return lines.join("\n");
+}
+
 /** Field table for a single issue, used in tool output and in the saved Markdown. */
 export function formatIssueDetail(issue) {
   const release = issue?.lastRelease?.version ?? issue?.firstRelease?.version ?? "";

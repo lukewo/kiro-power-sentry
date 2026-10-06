@@ -21533,6 +21533,13 @@ var PLACEHOLDER_VALUES = /* @__PURE__ */ new Set([
   "optional-project-slug"
 ]);
 var PERMISSIONS_DOC = "https://docs.sentry.io/api/permissions/";
+function parseNextLink(headers) {
+  const link = headers?.get?.("link") ?? "";
+  const next = link.split(",").find((part) => part.includes('rel="next"')) ?? "";
+  const hasMore = /results="true"/.test(next);
+  const cursor = /cursor="([^"]+)"/.exec(next);
+  return { hasMore, nextCursor: hasMore && cursor ? cursor[1] : void 0 };
+}
 var PROJECT_PAGE_CAP = 10;
 function ensureConfigFile() {
   if (existsSync(CONFIG_PATH)) return false;
@@ -21709,14 +21716,24 @@ var SentryClient = class {
    */
   async getList(path, query) {
     const { body, headers } = await this.get(path, query);
-    const link = headers.get("link") ?? "";
-    const next = link.split(",").find((part) => part.includes('rel="next"')) ?? "";
-    const hasMore = /results="true"/.test(next);
-    const cursor = /cursor="([^"]+)"/.exec(next);
     return {
       data: Array.isArray(body) ? body : [],
-      hasMore,
-      nextCursor: hasMore && cursor ? cursor[1] : void 0
+      ...parseNextLink(headers)
+    };
+  }
+  /**
+   * GET for a list endpoint that wraps its rows in an object, as the events
+   * endpoint does with { data, meta }. Kept separate from getList so the
+   * array-shaped endpoints keep their existing contract.
+   *
+   * @returns {Promise<{ data: any[], meta: any, hasMore: boolean, nextCursor?: string }>}
+   */
+  async getDataList(path, query) {
+    const { body, headers } = await this.get(path, query);
+    return {
+      data: Array.isArray(body?.data) ? body.data : [],
+      meta: body?.meta,
+      ...parseNextLink(headers)
     };
   }
   #orgPath(suffix) {
@@ -21748,10 +21765,26 @@ var SentryClient = class {
       statsPeriod,
       sort,
       limit,
+      environment
+      // No collapse: collapse=stats also strips count, userCount, firstSeen and
+      // lastSeen, which the issue list renders.
+    });
+  }
+  /**
+   * GET /api/0/organizations/{org}/events/ against the logs dataset, which backs
+   * Explore > Logs. Returns { data, meta } rather than a bare array.
+   */
+  async searchLogs({ query, project, statsPeriod, environment, fields, limit, sort, cursor }) {
+    return this.getDataList(this.#orgPath("events/"), {
+      dataset: "logs",
+      field: fields,
+      query,
+      project,
+      statsPeriod,
       environment,
-      // Drops the per-issue time series from the payload; the counts we render
-      // are returned either way and the series is pure context bloat.
-      collapse: "stats"
+      per_page: limit,
+      sort,
+      cursor
     });
   }
   /** GET /api/0/organizations/{org}/issues/{id}/ */
@@ -21905,6 +21938,54 @@ function formatIssueList(issues, { returned, hasMore, filters } = {}) {
   }
   lines.push(
     hasMore ? "More results exist beyond this page. Narrow the query or raise limit (max 50) to see them." : "This is the complete result set for these filters."
+  );
+  return lines.join("\n");
+}
+var LOG_TIMESTAMP_FIELD = "timestamp";
+var LOG_MESSAGE_FIELD = "message";
+var LOG_SEVERITY_FIELD = "severity";
+var LOG_TRACE_FIELD = "trace";
+var LOG_FIELDS = [
+  LOG_TIMESTAMP_FIELD,
+  LOG_MESSAGE_FIELD,
+  LOG_SEVERITY_FIELD,
+  LOG_TRACE_FIELD,
+  "project",
+  "environment",
+  "release"
+];
+function formatLogList(rows, { returned, hasMore, filters, fields = LOG_FIELDS } = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  const lines = [];
+  const filterLines = keyValueLines(filters);
+  lines.push("## Filters applied");
+  lines.push("");
+  lines.push(filterLines.length > 0 ? filterLines.join("\n") : "(none)");
+  lines.push("");
+  lines.push(`## Log entries (${returned ?? list.length} returned)`);
+  lines.push("");
+  if (list.length === 0) {
+    lines.push("No log entries matched.");
+  } else {
+    const detailFields = fields.filter(
+      (field) => field !== LOG_TIMESTAMP_FIELD && field !== LOG_MESSAGE_FIELD && field !== LOG_SEVERITY_FIELD
+    );
+    for (const row of list) {
+      const severity = cell(row?.[LOG_SEVERITY_FIELD]) || "none";
+      const message = tidyText(row?.[LOG_MESSAGE_FIELD] ?? "", 500).replace(/\n+/g, " ");
+      lines.push(
+        `### ${cell(row?.[LOG_TIMESTAMP_FIELD]) || "(no timestamp)"} [${severity}] ${message || "(no message)"}`
+      );
+      lines.push("");
+      for (const field of detailFields) {
+        const value = cell(row?.[field]);
+        if (value) lines.push(`- ${field}: ${value}`);
+      }
+      lines.push("");
+    }
+  }
+  lines.push(
+    hasMore ? "More log entries exist beyond this page. Narrow the query, raise limit (max 100) or shorten the time window to see them." : "This is the complete result set for these filters."
   );
   return lines.join("\n");
 }
@@ -22254,6 +22335,8 @@ function saveIssue(issue2, latestEvent, eventError = null) {
 var PROJECT_ROW_CAP = 100;
 var DEFAULT_ISSUE_LIMIT = 25;
 var MAX_ISSUE_LIMIT = 50;
+var DEFAULT_LOG_LIMIT = 50;
+var MAX_LOG_LIMIT = 100;
 var client;
 try {
   client = new SentryClient(readConfig());
@@ -22264,7 +22347,7 @@ try {
 }
 var server = new McpServer({
   name: "sentry",
-  version: "1.0.0"
+  version: "1.1.0"
 });
 function toolText(text) {
   return { content: [{ type: "text", text }] };
@@ -22336,6 +22419,69 @@ server.registerTool(
       );
     } catch (err) {
       return toolError(`search_issues failed: ${err.message}`);
+    }
+  }
+);
+server.registerTool(
+  "search_logs",
+  {
+    title: "Search Sentry logs",
+    description: "Search Sentry structured Logs (Explore > Logs), a separate dataset from issues and events. Use it to follow what happened for a user, driver, order or trace. Returns a capped list of log entries, newest first; saves nothing to disk. Read-only.",
+    inputSchema: {
+      query: external_exports.string().optional().describe(
+        "Sentry search query over log attributes. Omit for no filter. Raw text matches the message attribute and IS case sensitive; quote a phrase to match it exactly. Filters that work: severity:error, trace:abc123, environment:PROD_BFF, release:1.2.3, and custom log attributes such as DriverId:15744."
+      ),
+      project: external_exports.string().optional().describe(
+        "Project slug or numeric id. Passed to Sentry verbatim. Defaults to defaultProject from config."
+      ),
+      statsPeriod: external_exports.string().optional().describe("Relative time window, e.g. 1h, 24h, 14d, 90d (default 24h)"),
+      severity: external_exports.string().optional().describe(
+        "Convenience filter folded into the query as severity:<value>, e.g. error, warn, info, debug. Composes with query rather than replacing it."
+      ),
+      limit: external_exports.number().int().min(1).max(MAX_LOG_LIMIT).optional().describe(`Maximum log entries to return (1-${MAX_LOG_LIMIT}, default ${DEFAULT_LOG_LIMIT})`),
+      environment: external_exports.string().optional().describe("Environment name to filter by, e.g. PROD_BFF"),
+      sort: external_exports.string().optional().describe("Sort order, e.g. -timestamp for newest first or timestamp for oldest first (default -timestamp)")
+    }
+  },
+  async ({ query, project, statsPeriod, severity, limit, environment, sort }) => {
+    try {
+      const terms = [];
+      const userQuery = query?.trim();
+      if (userQuery) terms.push(userQuery);
+      const severityValue = severity?.trim();
+      if (severityValue) terms.push(`severity:${severityValue}`);
+      const effectiveQuery = terms.join(" ");
+      const effectivePeriod = statsPeriod?.trim() || "24h";
+      const effectiveSort = sort?.trim() || "-timestamp";
+      const cap = Math.min(limit ?? DEFAULT_LOG_LIMIT, MAX_LOG_LIMIT);
+      const projectInput = project?.trim() || client.defaultProject || void 0;
+      const { data, hasMore } = await client.searchLogs({
+        query: effectiveQuery || void 0,
+        project: projectInput,
+        statsPeriod: effectivePeriod,
+        environment: environment?.trim() || void 0,
+        fields: LOG_FIELDS,
+        limit: cap,
+        sort: effectiveSort
+      });
+      return toolText(
+        formatLogList(data, {
+          returned: data.length,
+          hasMore,
+          fields: LOG_FIELDS,
+          filters: {
+            query: effectiveQuery || "(none - all log entries)",
+            project: projectInput ?? "(all projects)",
+            statsPeriod: effectivePeriod,
+            severity: severityValue || "(all)",
+            sort: effectiveSort,
+            limit: cap,
+            environment: environment?.trim() || "(all)"
+          }
+        })
+      );
+    } catch (err) {
+      return toolError(`search_logs failed: ${err.message}`);
     }
   }
 );

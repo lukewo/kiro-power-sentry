@@ -48,6 +48,15 @@ const PLACEHOLDER_VALUES = new Set([
 
 const PERMISSIONS_DOC = "https://docs.sentry.io/api/permissions/";
 
+/** Reads Sentry's rel="next" Link header, which is how it signals further pages. */
+function parseNextLink(headers) {
+  const link = headers?.get?.("link") ?? "";
+  const next = link.split(",").find((part) => part.includes('rel="next"')) ?? "";
+  const hasMore = /results="true"/.test(next);
+  const cursor = /cursor="([^"]+)"/.exec(next);
+  return { hasMore, nextCursor: hasMore && cursor ? cursor[1] : undefined };
+}
+
 // Bounds the project cursor walk so a pathological org cannot spin forever.
 const PROJECT_PAGE_CAP = 10;
 
@@ -291,14 +300,25 @@ export class SentryClient {
    */
   async getList(path, query) {
     const { body, headers } = await this.get(path, query);
-    const link = headers.get("link") ?? "";
-    const next = link.split(",").find((part) => part.includes('rel="next"')) ?? "";
-    const hasMore = /results="true"/.test(next);
-    const cursor = /cursor="([^"]+)"/.exec(next);
     return {
       data: Array.isArray(body) ? body : [],
-      hasMore,
-      nextCursor: hasMore && cursor ? cursor[1] : undefined,
+      ...parseNextLink(headers),
+    };
+  }
+
+  /**
+   * GET for a list endpoint that wraps its rows in an object, as the events
+   * endpoint does with { data, meta }. Kept separate from getList so the
+   * array-shaped endpoints keep their existing contract.
+   *
+   * @returns {Promise<{ data: any[], meta: any, hasMore: boolean, nextCursor?: string }>}
+   */
+  async getDataList(path, query) {
+    const { body, headers } = await this.get(path, query);
+    return {
+      data: Array.isArray(body?.data) ? body.data : [],
+      meta: body?.meta,
+      ...parseNextLink(headers),
     };
   }
 
@@ -334,9 +354,28 @@ export class SentryClient {
       sort,
       limit,
       environment,
-      // Drops the per-issue time series from the payload; the counts we render
-      // are returned either way and the series is pure context bloat.
-      collapse: "stats",
+      // No collapse: collapse=stats also strips count, userCount, firstSeen and
+      // lastSeen, which the issue list renders.
+    });
+  }
+
+  /**
+   * GET /api/0/organizations/{org}/events/ against the logs dataset, which backs
+   * Explore > Logs. Returns { data, meta } rather than a bare array.
+   */
+  async searchLogs({ query, project, statsPeriod, environment, fields, limit, sort, cursor }) {
+    // This endpoint accepts a project slug directly, so no resolveProjectId hop
+    // is needed here (unlike searchIssues, which takes numeric ids only).
+    return this.getDataList(this.#orgPath("events/"), {
+      dataset: "logs",
+      field: fields,
+      query,
+      project,
+      statsPeriod,
+      environment,
+      per_page: limit,
+      sort,
+      cursor,
     });
   }
 

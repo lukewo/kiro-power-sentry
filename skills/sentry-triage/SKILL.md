@@ -1,18 +1,21 @@
 ---
 name: "sentry-triage"
-description: "Triage a Sentry crash report down to a specific stack trace. Use when someone reports a crash, a spike in errors, or a vague production problem and you need the actual exception, frames and affected devices."
+description: "Triage a Sentry crash report down to a specific stack trace, or follow a user's activity through Sentry structured logs. Use when someone reports a crash, a spike in errors, or a vague production problem and you need the actual exception, frames, affected devices or the log trail."
 license: "MIT"
 metadata:
   author: "Luke Worthington"
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # Sentry triage
 
 Turn a vague crash report into a concrete exception and stack trace using the
-read-only `sentry` power. The five tools form one linear workflow: find the
-project, search for the issue, open the issue, open a specific event, then slice
-the issue by tag to see what it concentrates on.
+read-only `sentry` power. The six tools cover two entry points:
+
+- **Something broke** - find the project, search issues, open the issue, open a
+  specific event, then slice the issue by tag to see what it concentrates on.
+- **What was this user doing** - search the structured logs for that user,
+  driver, order or trace, then pivot to an issue through the `trace` value.
 
 Everything here is read-only. None of these tools can resolve, ignore, assign,
 comment on or delete anything in Sentry.
@@ -100,6 +103,71 @@ With `key`: that one key in detail, values sorted by count with percentages and
 last-seen dates. This is how you tell "all Android 9" or "only release 3.4.1"
 from "everywhere".
 
+### 6. Follow one user's trail - `search_logs`
+
+Logs are a separate dataset (Sentry's **Explore > Logs**), so this is a sibling
+entry point rather than a later step. Reach for it when the report is "what
+happened for this driver / user / order" rather than "what crashed". There are no
+stack traces here; the hop back to a crash is the `trace` value.
+
+```
+search_logs { "project": "my-android-app", "statsPeriod": "24h", "limit": 50 }
+search_logs { "query": "offline", "severity": "warn", "project": "my-android-app", "statsPeriod": "24h" }
+```
+
+- `query` matches the `message` attribute as raw text, **case sensitive**; quote a
+  phrase to match it whole. Attribute filters such as `severity:error`,
+  `trace:abc123`, `environment:PROD_BFF` and custom attributes all work.
+- `severity` is a convenience folded into the query as `severity:<value>`, so it
+  narrows your query rather than replacing it.
+- `project` takes a slug directly, no lookup needed, and falls back to
+  `defaultProject`.
+- `statsPeriod` defaults to `24h`; `limit` is capped at 100 (`per_page` max).
+- Rows come back newest first and nothing is written to disk.
+
+**Worked example - one driver.** Identity in logs comes from whatever attribute
+the app sets, not from `user.id` (that field exists on the events API but stays
+empty on log rows). On a Pingo-style app the driver arrives as `DriverId`:
+
+```
+search_logs { "query": "DriverId:15744", "project": "pingo-dotnet-xamarin", "statsPeriod": "24h" }
+```
+
+Nothing back? Widen before doubting the query:
+
+```
+search_logs { "query": "DriverId:15744", "project": "pingo-dotnet-xamarin", "statsPeriod": "14d" }
+```
+
+Still nothing across a wide window usually means that user genuinely produced no
+logs in retention, or the attribute name differs - try `has:DriverId` on a short
+window to see the attribute populated, and confirm the spelling from a real row.
+Then narrow to the failures and take the trace across:
+
+```
+search_logs { "query": "DriverId:15744", "severity": "error", "project": "pingo-dotnet-xamarin", "statsPeriod": "14d" }
+search_issues { "query": "trace:4f1c...", "project": "pingo-dotnet-xamarin", "statsPeriod": "14d" }
+```
+
+The same driver may also have issues of their own, which is the issues-side
+query: `search_issues { "query": "user.id:15744" }`.
+
+## Log search recipes
+
+Pass any of these as `query` to `search_logs`.
+
+| Query | Finds |
+|---|---|
+| `severity:error` | Error-level log rows. Also `warn`, `info`, `debug`. |
+| `"API call attempted while offline"` | An exact message phrase, case sensitive. |
+| `offline` | Rows whose message contains that text, case sensitive. |
+| `trace:67e04bb66c9144ecaf1d47ac5da63697` | Everything logged in one trace, across services. |
+| `environment:PROD_BFF` | One environment. The `environment` argument does the same. |
+| `release:1.2.3` | Rows from one release. |
+| `DriverId:15744` | A custom attribute your app logs. |
+| `has:DriverId` | Rows that carry that attribute at all. |
+| `severity:error DriverId:15744` | Several terms, ANDed with spaces. |
+
 ## Sentry search recipes
 
 Pass any of these as `query` to `search_issues`. Terms combine with spaces.
@@ -151,7 +219,7 @@ Useful combinations:
 - `get_issue` writes `<workspace>/.sentry/<ID>/<ID>.md` and creates a
   `.gitignore` inside `.sentry/` on first use, so the cache is never committed.
   Re-fetching overwrites the file with the latest data.
-- `search_issues`, `get_event` and `get_issue_tags` write nothing.
+- `search_issues`, `search_logs`, `get_event` and `get_issue_tags` write nothing.
 
 ## Troubleshooting
 

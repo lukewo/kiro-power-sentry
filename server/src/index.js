@@ -23,15 +23,20 @@ import {
   formatEvent,
   formatIssueDetail,
   formatIssueList,
+  formatLogList,
   formatProjects,
   formatTagDetail,
   formatTagOverview,
+  LOG_FIELDS,
 } from "./format.js";
 import { saveIssue } from "./issue-store.js";
 
 const PROJECT_ROW_CAP = 100;
 const DEFAULT_ISSUE_LIMIT = 25;
 const MAX_ISSUE_LIMIT = 50;
+const DEFAULT_LOG_LIMIT = 50;
+// per_page on the events endpoint tops out at 100.
+const MAX_LOG_LIMIT = 100;
 
 // Fail fast with a clear message if the credentials are not configured.
 let client;
@@ -44,7 +49,7 @@ try {
 
 const server = new McpServer({
   name: "sentry",
-  version: "1.0.0",
+  version: "1.1.0",
 });
 
 /** These tools return readable text rather than JSON, so the model can read it directly. */
@@ -151,6 +156,101 @@ server.registerTool(
       );
     } catch (err) {
       return toolError(`search_issues failed: ${err.message}`);
+    }
+  }
+);
+
+server.registerTool(
+  "search_logs",
+  {
+    title: "Search Sentry logs",
+    description:
+      "Search Sentry structured Logs (Explore > Logs), a separate dataset from issues and events. " +
+      "Use it to follow what happened for a user, driver, order or trace. Returns a capped list of " +
+      "log entries, newest first; saves nothing to disk. Read-only.",
+    inputSchema: {
+      query: z
+        .string()
+        .optional()
+        .describe(
+          "Sentry search query over log attributes. Omit for no filter. Raw text matches the message " +
+            "attribute and IS case sensitive; quote a phrase to match it exactly. Filters that work: " +
+            "severity:error, trace:abc123, environment:PROD_BFF, release:1.2.3, and custom log " +
+            "attributes such as DriverId:15744."
+        ),
+      project: z
+        .string()
+        .optional()
+        .describe(
+          "Project slug or numeric id. Passed to Sentry verbatim. Defaults to defaultProject from config."
+        ),
+      statsPeriod: z
+        .string()
+        .optional()
+        .describe("Relative time window, e.g. 1h, 24h, 14d, 90d (default 24h)"),
+      severity: z
+        .string()
+        .optional()
+        .describe(
+          "Convenience filter folded into the query as severity:<value>, e.g. error, warn, info, debug. " +
+            "Composes with query rather than replacing it."
+        ),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_LOG_LIMIT)
+        .optional()
+        .describe(`Maximum log entries to return (1-${MAX_LOG_LIMIT}, default ${DEFAULT_LOG_LIMIT})`),
+      environment: z.string().optional().describe("Environment name to filter by, e.g. PROD_BFF"),
+      sort: z
+        .string()
+        .optional()
+        .describe("Sort order, e.g. -timestamp for newest first or timestamp for oldest first (default -timestamp)"),
+    },
+  },
+  async ({ query, project, statsPeriod, severity, limit, environment, sort }) => {
+    try {
+      const terms = [];
+      const userQuery = query?.trim();
+      if (userQuery) terms.push(userQuery);
+      const severityValue = severity?.trim();
+      if (severityValue) terms.push(`severity:${severityValue}`);
+      const effectiveQuery = terms.join(" ");
+
+      const effectivePeriod = statsPeriod?.trim() || "24h";
+      const effectiveSort = sort?.trim() || "-timestamp";
+      const cap = Math.min(limit ?? DEFAULT_LOG_LIMIT, MAX_LOG_LIMIT);
+      const projectInput = project?.trim() || client.defaultProject || undefined;
+
+      const { data, hasMore } = await client.searchLogs({
+        query: effectiveQuery || undefined,
+        project: projectInput,
+        statsPeriod: effectivePeriod,
+        environment: environment?.trim() || undefined,
+        fields: LOG_FIELDS,
+        limit: cap,
+        sort: effectiveSort,
+      });
+
+      return toolText(
+        formatLogList(data, {
+          returned: data.length,
+          hasMore,
+          fields: LOG_FIELDS,
+          filters: {
+            query: effectiveQuery || "(none - all log entries)",
+            project: projectInput ?? "(all projects)",
+            statsPeriod: effectivePeriod,
+            severity: severityValue || "(all)",
+            sort: effectiveSort,
+            limit: cap,
+            environment: environment?.trim() || "(all)",
+          },
+        })
+      );
+    } catch (err) {
+      return toolError(`search_logs failed: ${err.message}`);
     }
   }
 );

@@ -16,9 +16,41 @@ path that could issue a POST, PUT, PATCH or DELETE.
 |---|---|
 | `list_projects` | List the organization's projects with slugs, names and platforms. The slug is what `search_issues` filters on. |
 | `search_issues` | Search issues with Sentry search syntax (default `is:unresolved`, default window `14d`). Returns a capped list with event and user counts; **does not save anything to disk**. |
+| `search_logs` | Search structured Logs (Sentry's **Explore > Logs**) with Sentry search syntax. Default window `24h`, `limit` max 100, newest first. Shows timestamp, severity, message, trace, project, environment and release; **does not save anything to disk**. |
 | `get_issue` | Fetch one issue by numeric id or short id (e.g. `MYAPP-4F2`) plus its latest event, and save it to `.sentry/<ID>/` in your workspace (see below). Returns the summary plus where it was saved. |
 | `get_event` | Fetch one event (`latest`, `oldest`, `recommended`, or a specific id) and render the exception chain, stack frames, breadcrumbs and tags. Saves nothing. |
 | `get_issue_tags` | Tag breakdown for an issue: every key with its top values and counts, or a single key in detail. |
+
+## Sentry Logs are a separate dataset
+
+`search_logs` reads Sentry's structured **Logs**, which is a different dataset
+from issues and events. Issues answer "what broke"; logs answer "what was
+happening for this user, driver, order or trace". A log row is not attached to an
+issue, so nothing found here has a stack trace - use the `trace` value to pivot
+across to the matching issue or event.
+
+What the query argument accepts:
+
+- Raw text matches the `message` attribute and **is case sensitive**. Quote a
+  phrase to match it as a whole, e.g. `"API call attempted while offline"`.
+- `severity:error` (also `warn`, `info`, `debug`), and the `severity` argument is
+  a convenience that is folded into the query as `severity:<value>`; it composes
+  with your query rather than replacing it.
+- `trace:abc123...`, `environment:PROD_BFF`, `release:1.2.3`.
+- Any custom log attribute your app sets, e.g. `DriverId:15744`,
+  `order.id:order_123`, plus `has:<attribute>` to require one.
+- `user.id` is accepted by the API but is **not** populated on log rows - user
+  identity in logs arrives as whatever custom attribute your app logs.
+
+Other behaviour worth knowing:
+
+- `project` takes a slug **or** a numeric id and is passed to Sentry verbatim, so
+  no extra project lookup happens.
+- `statsPeriod` defaults to `24h`. Longer windows including `90d` are accepted,
+  but logs have their own retention, so a long window can only reach as far back
+  as your plan keeps logs.
+- `limit` maps to `per_page`, which Sentry caps at **100**.
+- Scope-wise nothing changes: the existing `org:read` on your token is enough.
 
 ## Fetched issues are saved into your workspace
 
@@ -131,7 +163,7 @@ scopes are needed - the power cannot use them.
 ### 3. Reconnect
 
 Reconnect the `sentry` server in Kiro's **MCP Servers** panel (or restart Kiro).
-The five tools become available.
+The six tools become available.
 
 ## Where the config file lives
 
@@ -161,8 +193,8 @@ It sits **outside** the power directory on purpose:
 2. Let the server start once so it creates the config file, then fill in
    `organization` and `authToken` as above.
 3. Reconnect the `sentry` server in Kiro's **MCP Servers** panel. It should
-   connect and list `list_projects`, `search_issues`, `get_issue`, `get_event`
-   and `get_issue_tags`.
+   connect and list `list_projects`, `search_issues`, `search_logs`, `get_issue`,
+   `get_event` and `get_issue_tags`.
 4. Ask Kiro to list your Sentry projects. You should get a table of slugs.
 5. Ask Kiro to search a project for unresolved issues, e.g. "search Sentry for
    unresolved issues in my-android-app". Confirm the issues listed are the ones
@@ -171,6 +203,10 @@ It sits **outside** the power directory on purpose:
    MYAPP-4F2". Confirm the response names a saved Markdown path, and open that
    file to check the stack trace is present and readable.
 7. Ask Kiro for that issue's tags, e.g. "show the os.name tag for MYAPP-4F2".
+8. Ask Kiro for recent Sentry logs, e.g. "show the last 10 Sentry log entries for
+   my-android-app". You should get timestamped entries with severity and message.
+   If nothing comes back, widen `statsPeriod` before suspecting the query - the
+   default window is only `24h`.
 
 If the server reports missing values, re-check the config file path from the
 error message and that `organization` and `authToken` are both filled in.
