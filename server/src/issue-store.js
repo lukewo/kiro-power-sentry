@@ -6,6 +6,8 @@
 //     .gitignore              - ignores everything here, so issues are never committed
 //     <ISSUE-ID>/
 //       <ISSUE-ID>.md         - issue details plus the latest event's stack trace
+//     logs/
+//       <project>_<query>_<time>.log - search_logs exports, see log-store.js
 //
 // If the workspace cannot be determined, the same structure is written under the
 // power's own data directory instead, so a fetch never silently loses data.
@@ -18,10 +20,10 @@ import { formatEvent, formatIssueDetail, formatIssueExtras, tidyText } from "./f
 import { detectWorkspace } from "./workspace.js";
 
 /**
- * Resolves the root the issue folders live under, preferring the open workspace
- * and falling back to the power's data directory.
+ * Resolves the root the issue and log folders live under, preferring the open
+ * workspace and falling back to the power's data directory.
  */
-function resolveIssueRoot() {
+export function resolveSentryRoot() {
   const ws = detectWorkspace();
   if (ws.path) {
     return {
@@ -45,11 +47,11 @@ function resolveIssueRoot() {
  * Ensures a .gitignore inside the .sentry folder so issue data is never
  * committed. Written once; an existing file is left untouched.
  */
-function ensureGitignore(root) {
+export function ensureGitignore(root) {
   const path = join(root, ".gitignore");
   if (existsSync(path)) return;
   const body =
-    "# Sentry issue data fetched by the sentry Kiro power.\n" +
+    "# Sentry issues and logs fetched by the sentry Kiro power.\n" +
     "# Local working context - not intended to be committed.\n" +
     "*\n" +
     "!.gitignore\n";
@@ -94,7 +96,7 @@ function renderIssueMarkdown(issue, latestEvent, eventError) {
  * @param {string|null} [eventError] why the event is missing, if it is
  */
 export function saveIssue(issue, latestEvent, eventError = null) {
-  const target = resolveIssueRoot();
+  const target = resolveSentryRoot();
   const folder = safeName(issue?.shortId ?? issue?.id, "unknown-issue");
 
   const issueDir = join(target.root, folder);

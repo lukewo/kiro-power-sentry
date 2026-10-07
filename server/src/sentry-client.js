@@ -60,6 +60,11 @@ function parseNextLink(headers) {
 // Bounds the project cursor walk so a pathological org cannot spin forever.
 const PROJECT_PAGE_CAP = 10;
 
+// per_page is a single page's size (Sentry max 100); limit passed to searchLogs is the total across pages.
+const LOG_PAGE_SIZE = 100;
+// 50 pages x 100 = the 5000-row ceiling; a hard stop independent of the row count.
+const LOG_PAGE_CAP = 50;
+
 /**
  * Writes the empty config template if no config file exists yet, so the user
  * has a file to fill in rather than having to create one from scratch.
@@ -361,22 +366,49 @@ export class SentryClient {
 
   /**
    * GET /api/0/organizations/{org}/events/ against the logs dataset, which backs
-   * Explore > Logs. Returns { data, meta } rather than a bare array.
+   * Explore > Logs. Follows the rel="next" cursor until `limit` rows are
+   * collected, LOG_PAGE_CAP pages are fetched, or results run out.
+   *
+   * @returns {Promise<{ data: any[], hasMore: boolean, pages: number }>}
+   *   hasMore - true when matching rows remain beyond what was returned
    */
-  async searchLogs({ query, project, statsPeriod, environment, fields, limit, sort, cursor }) {
-    // This endpoint accepts a project slug directly, so no resolveProjectId hop
-    // is needed here (unlike searchIssues, which takes numeric ids only).
-    return this.getDataList(this.#orgPath("events/"), {
-      dataset: "logs",
-      field: fields,
-      query,
-      project,
-      statsPeriod,
-      environment,
-      per_page: limit,
-      sort,
-      cursor,
-    });
+  async searchLogs({ query, project, statsPeriod, environment, fields, limit, sort }) {
+    const rows = [];
+    const seen = new Set();
+    let cursor;
+    let hasMore = false;
+    let pages = 0;
+    while (rows.length < limit && pages < LOG_PAGE_CAP) {
+      // This endpoint accepts a project slug directly, so no resolveProjectId hop
+      // is needed here (unlike searchIssues, which takes numeric ids only).
+      const page = await this.getDataList(this.#orgPath("events/"), {
+        dataset: "logs",
+        field: fields,
+        query,
+        project,
+        statsPeriod,
+        environment,
+        per_page: Math.min(LOG_PAGE_SIZE, limit - rows.length),
+        sort,
+        cursor,
+      });
+      pages += 1;
+      // Offset paging over live data repeats rows when new ones land mid-walk; drop them by row id.
+      for (const row of page.data) {
+        if (row?.id && seen.has(row.id)) continue;
+        if (row?.id) seen.add(row.id);
+        rows.push(row);
+      }
+      hasMore = Boolean(page.hasMore && page.nextCursor);
+      if (!hasMore || page.data.length === 0) break;
+      // Same cursor handed back twice in a row would loop forever; treat it as the end.
+      if (page.nextCursor === cursor) {
+        hasMore = false;
+        break;
+      }
+      cursor = page.nextCursor;
+    }
+    return { data: rows, hasMore, pages };
   }
 
   /** GET /api/0/organizations/{org}/issues/{id}/ */

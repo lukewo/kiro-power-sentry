@@ -16,7 +16,7 @@ path that could issue a POST, PUT, PATCH or DELETE.
 |---|---|
 | `list_projects` | List the organization's projects with slugs, names and platforms. The slug is what `search_issues` filters on. |
 | `search_issues` | Search issues with Sentry search syntax (default `is:unresolved`, default window `14d`). Returns a capped list with event and user counts; **does not save anything to disk**. |
-| `search_logs` | Search structured Logs (Sentry's **Explore > Logs**) with Sentry search syntax. Default window `24h`, `limit` max 100, newest first. Shows timestamp, severity, message, trace, project, environment and release; **does not save anything to disk**. |
+| `search_logs` | Search structured Logs (Sentry's **Explore > Logs**) with Sentry search syntax. Default window `24h`. Follows result pages to pull every matching row up to `limit` (default and max 5000), **always writes them oldest first to a Serilog-style `.log` file** under `<workspace>/.sentry/logs/` (see below), and returns the saved path plus whether the full set was retrieved or the ceiling was hit. Log lines are not echoed into chat. |
 | `get_issue` | Fetch one issue by numeric id or short id (e.g. `MYAPP-4F2`) plus its latest event, and save it to `.sentry/<ID>/` in your workspace (see below). Returns the summary plus where it was saved. |
 | `get_event` | Fetch one event (`latest`, `oldest`, `recommended`, or a specific id) and render the exception chain, stack frames, breadcrumbs and tags. Saves nothing. |
 | `get_issue_tags` | Tag breakdown for an issue: every key with its top values and counts, or a single key in detail. |
@@ -26,8 +26,8 @@ path that could issue a POST, PUT, PATCH or DELETE.
 `search_logs` reads Sentry's structured **Logs**, which is a different dataset
 from issues and events. Issues answer "what broke"; logs answer "what was
 happening for this user, driver, order or trace". A log row is not attached to an
-issue, so nothing found here has a stack trace - use the `trace` value to pivot
-across to the matching issue or event.
+issue, so nothing found here has a stack trace - to pivot across to the matching
+issue or event, search by trace (`trace:<id>`) on either side.
 
 What the query argument accepts:
 
@@ -49,21 +49,86 @@ Other behaviour worth knowing:
 - `statsPeriod` defaults to `24h`. Longer windows including `90d` are accepted,
   but logs have their own retention, so a long window can only reach as far back
   as your plan keeps logs.
-- `limit` maps to `per_page`, which Sentry caps at **100**.
+- `limit` is the **total** across pages, default and max **5000**. The power
+  requests pages of 100 (Sentry's `per_page` max) and follows the `rel="next"`
+  cursor, stopping at `limit`, at 50 pages, or when results run out. The
+  response and the file header both say `complete` (every matching row is in the
+  file) or `capped` (more rows exist beyond the ceiling - narrow the query or
+  window to get the rest), naming which ceiling was hit. Nothing is dropped
+  silently.
+- Sentry pages by offset, so on a busy project new log rows arriving during the
+  walk push earlier rows onto the next page. Those repeats are dropped by row id,
+  which means a very busy window can reach the 50-page ceiling with fewer than
+  `limit` rows; the status then says `capped` at the page ceiling.
+- `sort` decides which rows Sentry pages through first, so with the default
+  `-timestamp` a capped search keeps the newest 5000. The saved file is always
+  written oldest first whatever `sort` is.
 - Scope-wise nothing changes: the existing `org:read` on your token is enough.
+
+### Log searches are saved as .log files
+
+Every `search_logs` call writes its full result to a new file:
+
+```
+<workspace>/.sentry/logs/<project>_<query>_<yyyy-MM-ddTHHmmZ>.log
+```
+
+for example `pingo-dotnet-xamarin_DriverId-14429_2026-10-07T0738Z.log`. The
+project and the effective query (including a folded-in `severity`) have anything
+outside `A-Z a-z 0-9 . _ -` replaced with `-`, runs collapsed and each part
+capped at 60 characters. An empty query becomes `all` and no project becomes
+`all-projects`. The time is UTC. A second search in the same minute gets `-2`,
+`-3` and so on rather than overwriting the first.
+
+The file opens with a header block, every line prefixed `# ` so it never reads as
+a log entry: organization, project, the exact query, severity, environment,
+`statsPeriod` and the resolved UTC window, request sort, requested limit, pages
+fetched, row count, `complete` or `capped` status, the projects, environments and
+releases seen, and the generation time. Then one entry per line, oldest first,
+in the same shape as the app's device logs:
+
+```
+[2026-10-07 09:03:48.454 DBG] CheckNotification called
+[2026-10-07 09:03:48.478 INF] PushDelegate: finished handling push action 'TripNotification'
+```
+
+- Times are UTC, `yyyy-MM-dd HH:mm:ss.fff`, with milliseconds taken from Sentry's
+  `timestamp_precise`.
+- Embedded newlines in a message are replaced with spaces so each entry stays on
+  one line. The message is otherwise written as Sentry returned it.
+- `trace`, `environment` and `release` are not written on each line, so the file
+  matches the device-log shape. The header lists the projects, environments and
+  releases seen. Trace ids are not in the file; when you have one from an issue
+  or event, `search_logs { "query": "trace:<id>" }` pulls that trace's rows.
+
+| Sentry severity | Level written |
+|---|---|
+| `trace`, `verbose` | `VRB` |
+| `debug` | `DBG` |
+| `info`, `information` | `INF` |
+| `warn`, `warning` | `WRN` |
+| `error` | `ERR` |
+| `fatal`, `critical` | `FTL` |
+| anything else, or missing | `INF` |
+
+Log files use the same workspace detection and data-folder fallback as issues
+(below), landing in `~/.kiro/powers/data/kiro-power-sentry/logs/` when no
+workspace is detected, and are git-ignored by the same `.sentry/.gitignore`.
 
 ## Fetched issues are saved into your workspace
 
 Whenever an issue is fetched with `get_issue`, the power writes it into a
-`.sentry` folder in the workspace you have open, so it shows up in your file tree
-(`search_issues`, `get_event` and `get_issue_tags` are read-through only and save
-nothing):
+`.sentry` folder in the workspace you have open, so it shows up in your file tree.
+`search_logs` writes its `.log` files alongside, under `logs/`. `search_issues`,
+`get_event` and `get_issue_tags` are read-through only and save nothing:
 
 ```
 <workspace>/.sentry/
-  .gitignore              # ignores everything here, so issues are never committed
+  .gitignore              # ignores everything here, so issues and logs are never committed
   <ISSUE-ID>/
     <ISSUE-ID>.md         # issue details plus the latest event, as Markdown
+  logs/
+    <project>_<query>_<time>.log   # one file per search_logs call
 ```
 
 The Markdown captures the issue fields (title, short id, project, level, status,
@@ -203,10 +268,12 @@ It sits **outside** the power directory on purpose:
    MYAPP-4F2". Confirm the response names a saved Markdown path, and open that
    file to check the stack trace is present and readable.
 7. Ask Kiro for that issue's tags, e.g. "show the os.name tag for MYAPP-4F2".
-8. Ask Kiro for recent Sentry logs, e.g. "show the last 10 Sentry log entries for
-   my-android-app". You should get timestamped entries with severity and message.
-   If nothing comes back, widen `statsPeriod` before suspecting the query - the
-   default window is only `24h`.
+8. Ask Kiro for today's Sentry logs, e.g. "get today's Sentry logs for
+   my-android-app". The response names a saved `.log` path, the row count, and
+   whether the result is `complete` or `capped`. Open the file and check the
+   `[yyyy-MM-dd HH:mm:ss.fff INF] ...` lines run oldest first. If no rows come
+   back, widen `statsPeriod` before suspecting the query - the default window is
+   only `24h`.
 
 If the server reports missing values, re-check the config file path from the
 error message and that `organization` and `authToken` are both filled in.
@@ -268,8 +335,10 @@ problem exits immediately with a message naming the file and the missing fields.
   published package contains no credentials.
 - The token is never echoed into a tool response, a log line, or a saved file;
   anything built from an API error body has it redacted first.
-- Fetched issues are saved under `.sentry/` in your workspace (git-ignored).
-  Delete that folder any time; it is just local cache.
+- Fetched issues and log searches are saved under `.sentry/` in your workspace
+  (git-ignored). Delete that folder any time; it is just local cache.
+- A saved `.log` file is built only from the returned log rows and the search
+  parameters, never from the token or request headers.
 
 ## Building from source (maintainers)
 

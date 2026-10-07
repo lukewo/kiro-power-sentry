@@ -23,20 +23,20 @@ import {
   formatEvent,
   formatIssueDetail,
   formatIssueList,
-  formatLogList,
   formatProjects,
   formatTagDetail,
   formatTagOverview,
   LOG_FIELDS,
 } from "./format.js";
 import { saveIssue } from "./issue-store.js";
+import { saveLogs } from "./log-store.js";
 
 const PROJECT_ROW_CAP = 100;
 const DEFAULT_ISSUE_LIMIT = 25;
 const MAX_ISSUE_LIMIT = 50;
-const DEFAULT_LOG_LIMIT = 50;
-// per_page on the events endpoint tops out at 100.
-const MAX_LOG_LIMIT = 100;
+// limit is the total rows across all pages, not a page size; 5000 = 50 pages of 100.
+const DEFAULT_LOG_LIMIT = 5000;
+const MAX_LOG_LIMIT = 5000;
 
 // Fail fast with a clear message if the credentials are not configured.
 let client;
@@ -49,7 +49,7 @@ try {
 
 const server = new McpServer({
   name: "sentry",
-  version: "1.1.0",
+  version: "1.2.0",
 });
 
 /** These tools return readable text rather than JSON, so the model can read it directly. */
@@ -166,8 +166,11 @@ server.registerTool(
     title: "Search Sentry logs",
     description:
       "Search Sentry structured Logs (Explore > Logs), a separate dataset from issues and events. " +
-      "Use it to follow what happened for a user, driver, order or trace. Returns a capped list of " +
-      "log entries, newest first; saves nothing to disk. Read-only.",
+      "Use it to follow what happened for a user, driver, order or trace. Follows result pages to " +
+      `pull every matching row up to limit (default and max ${MAX_LOG_LIMIT}), writes them oldest ` +
+      "first to a Serilog-style .log file under .sentry/logs/ in the open workspace (git-ignored), " +
+      "and returns the saved path and whether the full set was retrieved. Log lines are not " +
+      "returned in chat. Read-only.",
     inputSchema: {
       query: z
         .string()
@@ -201,12 +204,19 @@ server.registerTool(
         .min(1)
         .max(MAX_LOG_LIMIT)
         .optional()
-        .describe(`Maximum log entries to return (1-${MAX_LOG_LIMIT}, default ${DEFAULT_LOG_LIMIT})`),
+        .describe(
+          `Total log entries to fetch across all pages (1-${MAX_LOG_LIMIT}, default ` +
+            `${DEFAULT_LOG_LIMIT}). Pages of 100 are followed until this many rows are collected ` +
+            "or results run out."
+        ),
       environment: z.string().optional().describe("Environment name to filter by, e.g. PROD_BFF"),
       sort: z
         .string()
         .optional()
-        .describe("Sort order, e.g. -timestamp for newest first or timestamp for oldest first (default -timestamp)"),
+        .describe(
+          "Sort order Sentry pages in, e.g. -timestamp for newest first or timestamp for oldest " +
+            "first (default -timestamp). The saved file is always written oldest first regardless."
+        ),
     },
   },
   async ({ query, project, statsPeriod, severity, limit, environment, sort }) => {
@@ -223,32 +233,68 @@ server.registerTool(
       const cap = Math.min(limit ?? DEFAULT_LOG_LIMIT, MAX_LOG_LIMIT);
       const projectInput = project?.trim() || client.defaultProject || undefined;
 
-      const { data, hasMore } = await client.searchLogs({
+      const environmentValue = environment?.trim() || undefined;
+
+      const { data, hasMore, pages } = await client.searchLogs({
         query: effectiveQuery || undefined,
         project: projectInput,
         statsPeriod: effectivePeriod,
-        environment: environment?.trim() || undefined,
+        environment: environmentValue,
         fields: LOG_FIELDS,
         limit: cap,
         sort: effectiveSort,
       });
 
-      return toolText(
-        formatLogList(data, {
-          returned: data.length,
-          hasMore,
-          fields: LOG_FIELDS,
-          filters: {
-            query: effectiveQuery || "(none - all log entries)",
-            project: projectInput ?? "(all projects)",
-            statsPeriod: effectivePeriod,
-            severity: severityValue || "(all)",
-            sort: effectiveSort,
-            limit: cap,
-            environment: environment?.trim() || "(all)",
-          },
-        })
-      );
+      // Dropping rows repeated by live paging can exhaust the page cap before the row limit.
+      const hitRowLimit = data.length >= cap;
+      const ceiling = hitRowLimit ? `the ${cap}-row limit` : `the ${pages}-page ceiling`;
+
+      const saved = saveLogs({
+        rows: data,
+        hasMore,
+        ceiling,
+        pages,
+        limit: cap,
+        sort: effectiveSort,
+        organization: client.organization,
+        project: projectInput,
+        query: effectiveQuery,
+        severity: severityValue,
+        environment: environmentValue,
+        statsPeriod: effectivePeriod,
+      });
+
+      const filters = {
+        query: effectiveQuery || "(none - all log entries)",
+        project: projectInput ?? "(all projects)",
+        statsPeriod: effectivePeriod,
+        severity: severityValue || "(all)",
+        sort: effectiveSort,
+        limit: cap,
+        environment: environmentValue ?? "(all)",
+      };
+
+      // The log lines live in the file only, so the chat response stays small at 5000 rows.
+      const lines = [
+        `Saved ${saved.rowCount} log entries to ${saved.logPath}`,
+        "",
+        hasMore
+          ? `- status: capped - stopped at ${ceiling}; more matching rows exist beyond it ` +
+            `(narrow the query or window` +
+            (hitRowLimit && cap < MAX_LOG_LIMIT ? `, or raise limit up to ${MAX_LOG_LIMIT})` : ")")
+          : "- status: complete - every matching row was retrieved",
+        `- rows: ${saved.rowCount}`,
+        `- pages fetched: ${pages}`,
+        `- savedInWorkspace: ${saved.savedInWorkspace}`,
+        `- workspace: ${saved.workspace ?? "(not detected)"}`,
+        `- locationAssumed: ${saved.locationAssumed}`,
+        `- locationReason: ${saved.locationReason}`,
+        "",
+        "## Filters applied",
+        "",
+        ...Object.entries(filters).map(([key, value]) => `${key} = ${value}`),
+      ];
+      return toolText(lines.join("\n"));
     } catch (err) {
       return toolError(`search_logs failed: ${err.message}`);
     }

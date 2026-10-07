@@ -4,7 +4,7 @@ description: "Triage a Sentry crash report down to a specific stack trace, or fo
 license: "MIT"
 metadata:
   author: "Luke Worthington"
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 # Sentry triage
@@ -14,8 +14,8 @@ read-only `sentry` power. The six tools cover two entry points:
 
 - **Something broke** - find the project, search issues, open the issue, open a
   specific event, then slice the issue by tag to see what it concentrates on.
-- **What was this user doing** - search the structured logs for that user,
-  driver, order or trace, then pivot to an issue through the `trace` value.
+- **What was this user doing** - pull the structured logs for that user,
+  driver, order or trace into a saved `.log` file and read it like a device log.
 
 Everything here is read-only. None of these tools can resolve, ignore, assign,
 comment on or delete anything in Sentry.
@@ -108,10 +108,10 @@ from "everywhere".
 Logs are a separate dataset (Sentry's **Explore > Logs**), so this is a sibling
 entry point rather than a later step. Reach for it when the report is "what
 happened for this driver / user / order" rather than "what crashed". There are no
-stack traces here; the hop back to a crash is the `trace` value.
+stack traces here; the hop back to a crash is a `trace:<id>` search.
 
 ```
-search_logs { "project": "my-android-app", "statsPeriod": "24h", "limit": 50 }
+search_logs { "project": "my-android-app", "statsPeriod": "24h" }
 search_logs { "query": "offline", "severity": "warn", "project": "my-android-app", "statsPeriod": "24h" }
 ```
 
@@ -122,8 +122,22 @@ search_logs { "query": "offline", "severity": "warn", "project": "my-android-app
   narrows your query rather than replacing it.
 - `project` takes a slug directly, no lookup needed, and falls back to
   `defaultProject`.
-- `statsPeriod` defaults to `24h`; `limit` is capped at 100 (`per_page` max).
-- Rows come back newest first and nothing is written to disk.
+- `statsPeriod` defaults to `24h`.
+- `limit` is the **total** rows, default and max 5000. The power follows pages
+  of 100 itself, so a whole day for one driver is a single call - do not page
+  manually or lower `limit` to save space.
+- Every call writes the full result to a new file, e.g.
+  `.sentry/logs/pingo-dotnet-xamarin_DriverId-15744_2026-10-07T0738Z.log`,
+  oldest first, one `[yyyy-MM-dd HH:mm:ss.fff LVL] message` line per entry in
+  UTC (the same shape as the app's device logs). A `# ` header records the
+  filters, row count and status.
+- The response gives the saved path, the row count, `complete` or `capped`, and
+  where it was saved (`savedInWorkspace`, `workspace`, `locationAssumed`,
+  `locationReason`). The log lines are **not** in chat: open or grep the file.
+- `capped` means more rows matched than were saved: either `limit` rows or the
+  50-page ceiling was reached first (the status names which), keeping the first
+  rows in `sort` order (the newest, by default). Narrow the window or add
+  `severity` and search again.
 
 **Worked example - one driver.** Identity in logs comes from whatever attribute
 the app sets, not from `user.id` (that field exists on the events API but stays
@@ -133,7 +147,15 @@ empty on log rows). On a Pingo-style app the driver arrives as `DriverId`:
 search_logs { "query": "DriverId:15744", "project": "pingo-dotnet-xamarin", "statsPeriod": "24h" }
 ```
 
-Nothing back? Widen before doubting the query:
+That one call pulls the driver's whole day and saves it as
+`.sentry/logs/pingo-dotnet-xamarin_DriverId-15744_<yyyy-MM-ddTHHmmZ>.log`.
+Open that file and read it top to bottom; it runs chronologically like a device
+log, so you can line it up against a device log pulled for the same session
+(remember the saved file is UTC). Grep it for `ERR` or `WRN` to find the
+trouble spots. `trace` is not written on the lines, so to pivot to a crash use
+`search_issues` for the same driver or window.
+
+Zero rows? Widen before doubting the query:
 
 ```
 search_logs { "query": "DriverId:15744", "project": "pingo-dotnet-xamarin", "statsPeriod": "14d" }
@@ -142,11 +164,12 @@ search_logs { "query": "DriverId:15744", "project": "pingo-dotnet-xamarin", "sta
 Still nothing across a wide window usually means that user genuinely produced no
 logs in retention, or the attribute name differs - try `has:DriverId` on a short
 window to see the attribute populated, and confirm the spelling from a real row.
-Then narrow to the failures and take the trace across:
+To save just the failures, add `severity`. When an issue or event gives you a
+trace id, pull every log row in that trace:
 
 ```
 search_logs { "query": "DriverId:15744", "severity": "error", "project": "pingo-dotnet-xamarin", "statsPeriod": "14d" }
-search_issues { "query": "trace:4f1c...", "project": "pingo-dotnet-xamarin", "statsPeriod": "14d" }
+search_logs { "query": "trace:4f1c...", "project": "pingo-dotnet-xamarin", "statsPeriod": "14d" }
 ```
 
 The same driver may also have issues of their own, which is the issues-side
@@ -219,7 +242,10 @@ Useful combinations:
 - `get_issue` writes `<workspace>/.sentry/<ID>/<ID>.md` and creates a
   `.gitignore` inside `.sentry/` on first use, so the cache is never committed.
   Re-fetching overwrites the file with the latest data.
-- `search_issues`, `search_logs`, `get_event` and `get_issue_tags` write nothing.
+- `search_logs` writes a new `<workspace>/.sentry/logs/<project>_<query>_<time>.log`
+  on every call (a same-minute repeat gets `-2`, `-3`, never an overwrite), under
+  the same `.gitignore`.
+- `search_issues`, `get_event` and `get_issue_tags` write nothing.
 
 ## Troubleshooting
 

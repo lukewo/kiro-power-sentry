@@ -1,6 +1,6 @@
 {
   "name": "sentry-mcp-server",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Read-only local MCP server exposing Sentry REST API read tools for the sentry Kiro Power.",
   "type": "module",
